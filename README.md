@@ -1,1 +1,1 @@
-linux arm snapdragon for acer 14 ai resources for a time :)
+fedora linux on arm snapdragon for acer 14 ai resources ;)
