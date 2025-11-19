@@ -3,19 +3,9 @@
 set -e
 set -u
 
-WIN_FW_PATH="Windows/System32/DriverStore/FileRepository"
-
-search_path=""
-while getopts ":d:" opt; do
-	case ${opt} in
-		d)
-			search_path="${OPTARG}"
-			;;
-		?)
-			exit 1
-			;;
-	esac
-done
+# Get the directory where the script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WIN_FW_PATH="FileRepository"
 
 device_model="$(tr -d '\0' </proc/device-tree/model)"
 case "$device_model" in
@@ -44,7 +34,8 @@ case "$device_model" in
 		device_path="SAMSUNG/galaxy-book4-edge"
 		;;
 	*)
-		printf "error: Device is currently not supported" >&2
+		printf "error: Device is currently not supported\n" >&2
+		exit 1
 		;;
 esac
 
@@ -52,42 +43,18 @@ device_canonical=$(echo "$device_path" | \
   tr '[:upper:]' '[:lower:]' | tr -d '-' | tr '/' '-')
 
 tmpdir="$(mktemp -p /tmp -d fwfetch.XXXXXXXX)"
-mkdir -p "$tmpdir/dislocker"
-mkdir -p "$tmpdir/mnt"
 
 function cleanup {
-	umount -qRf "$tmpdir/mnt"
-	umount -qRf "$tmpdir/dislocker"
 	rm -rf "$tmpdir"
 }
 trap cleanup EXIT
 
-# Find BitLocker Partition on NVME
-part=$(lsblk -l -o NAME,FSTYPE | grep nvme0n1 | grep BitLocker | cut -d" " -f1)
+# Look for FileRepository folder next to the script
+search_path="${SCRIPT_DIR}/${WIN_FW_PATH}"
 
-# If we cant find a non-bitlocker'd part, pick the first ntfs part and try to mount
-nobitlocker=0
-if [ -z "$part" ]; then
-	part=$(lsblk -l -o NAME,FSTYPE | grep -E -m 1 "(^nvme[0-9]n[0-9]p[0-9]{1,2}\s+ntfs$)" | cut -d" " -f1)
-	nobitlocker=1
-fi
-
-if [ -z "$part" ]; then
-	printf "error: Failed to find windows partition" >&2
+if [ ! -d "$search_path" ]; then
+	printf "error: FileRepository folder not found at %s\n" "$search_path" >&2
 	exit 1
-fi
-
-if [ -z "$search_path" ]; then
-	echo "Mounting Windows partition ${part}..."
-	# Decrypt and mount
-	if [ "$nobitlocker" -eq 0 ]; then
-		dislocker --readonly "/dev/$part" -- "$tmpdir/dislocker"
-		mount -t ntfs-3g -oloop,ro "$tmpdir/dislocker/dislocker-file" "$tmpdir/mnt"
-	fi
-	if [ "$nobitlocker" -eq 1 ]; then
-		mount -t ntfs-3g -o ro "/dev/$part" "$tmpdir/mnt"
-	fi
-	search_path="${tmpdir}/mnt/${WIN_FW_PATH}"
 fi
 
 # Create Package boilerplate
@@ -180,6 +147,10 @@ echo "Extracting firmware from $search_path"
 for f_path in ${fw_files}; do
 	echo -e "\t${f_path}"
 	fw_path="$(find "${search_path}" -name "${f_path}" -exec ls -t {} + | head -n1)"
+	if [ -z "$fw_path" ]; then
+		printf "error: Could not find firmware file %s\n" "$f_path" >&2
+		exit 1
+	fi
 	cp "${fw_path}" "${pkgpath}/"
 done
 
@@ -196,6 +167,14 @@ dnf list --installed ${pkgname} > /dev/null \
  && dnf reinstall -y "aarch64/${pkgname}-${pkgver}-1.fc${VERSION_ID}.aarch64.rpm" > /dev/null \
  || dnf install -y "aarch64/${pkgname}-${pkgver}-1.fc${VERSION_ID}.aarch64.rpm" > /dev/null
 
-dracut --regenerate-all --force
+# Regenerate initramfs only for current kernel
+current_kernel="$(uname -r)"
+echo "Regenerating initramfs for current kernel: ${current_kernel}"
 
-echo -e "$(tput bold)Done! Reboot to load the added firmware files. $(tput sgr0)"
+if dracut --force --kver "${current_kernel}" 2>&1 | tee /tmp/dracut.log; then
+	echo -e "$(tput bold)Done! Reboot to load the added firmware files.$(tput sgr0)"
+else
+	echo "Warning: dracut encountered errors. Check /tmp/dracut.log for details."
+	echo "Firmware files have been installed to: ${fw_install_path}"
+	echo "You may need to manually regenerate initramfs with: dracut --force --kver ${current_kernel}"
+fi
